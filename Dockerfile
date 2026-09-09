@@ -35,13 +35,18 @@ RUN apt-get update \
          arm64) YT_DLP_ASSET=yt-dlp_linux_aarch64 ;; \
          *) echo "unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
        esac \
-    && curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/download/${YT_DLP_VERSION}/${YT_DLP_ASSET}" -o /usr/local/bin/yt-dlp \
-    && curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/download/${YT_DLP_VERSION}/SHA2-256SUMS" -o /tmp/SHA2-256SUMS \
+    && curl -fSL --retry 10 --retry-all-errors --retry-delay 3 -C - "https://github.com/yt-dlp/yt-dlp/releases/download/${YT_DLP_VERSION}/${YT_DLP_ASSET}" -o /usr/local/bin/yt-dlp \
+    && curl -fSL --retry 10 --retry-all-errors --retry-delay 3 "https://github.com/yt-dlp/yt-dlp/releases/download/${YT_DLP_VERSION}/SHA2-256SUMS" -o /tmp/SHA2-256SUMS \
     && printf '%s  yt-dlp\n' "$(grep " ${YT_DLP_ASSET}$" /tmp/SHA2-256SUMS | cut -d' ' -f1)" \
        | (cd /usr/local/bin && sha256sum -c -) \
     && rm -f /tmp/SHA2-256SUMS \
     && chmod a+rx /usr/local/bin/yt-dlp \
-    && curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s ${DENO_VERSION} \
+    && case "$(dpkg --print-architecture)" in \
+         amd64) DENO_ASSET=deno-x86_64-unknown-linux-gnu.zip ;; \
+         arm64) DENO_ASSET=deno-aarch64-unknown-linux-gnu.zip ;; \
+       esac \
+    && curl -fSL --retry 10 --retry-all-errors --retry-delay 3 -C - "https://github.com/denoland/deno/releases/download/${DENO_VERSION}/${DENO_ASSET}" -o /tmp/deno.zip \
+    && unzip -oq /tmp/deno.zip -d /usr/local/bin && rm -f /tmp/deno.zip && chmod a+rx /usr/local/bin/deno \
     && /usr/local/bin/yt-dlp --version \
     && /usr/local/bin/deno --version \
     && apt-get purge -y unzip && apt-get autoremove -y \
