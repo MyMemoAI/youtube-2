@@ -3,11 +3,61 @@ import { Hono } from "hono";
 
 const app = new Hono();
 
+const YT_DLP = "/usr/local/bin/yt-dlp";
+
+// Flags shared by every yt-dlp invocation.
+//
+// --extractor-args youtube:player_client=default,-web
+//   The default clients are `visionos,web` (yt-dlp 2026.08.19 README, "EXTRACTOR
+//   ARGUMENTS" > youtube > player_client). The `web` client is the one that
+//   carries WEB_PO_TOKEN_POLICIES and needs a JS challenge solve, and it is the
+//   client that produces "Sign in to confirm you're not a bot" from datacenter
+//   IPs without cookies/PO tokens. `visionos` requires no PO token and sets
+//   REQUIRE_JS_PLAYER=False, and yt-dlp still falls back to `tv_downgraded` /
+//   `web_embedded` on its own when `visionos` cannot access a video. The `-`
+//   exclusion prefix is documented in the same README section.
+// --extractor-args youtube:skip=hls,dash
+//   "One or more of `hls`, `dash` or `translated_subs` to skip extraction of the
+//   m3u8 manifests, dash manifests ... respectively" (same README section). We
+//   never download media, so these manifest requests are pure extra load and
+//   extra bot-check surface. `translated_subs` is deliberately NOT skipped: an
+//   explicit `lang` request may legitimately resolve to a translated track.
+// --socket-timeout 20 / --retries 3 / --extractor-retries 2
+//   "Time to wait before giving up, in seconds" / "Number of retries (default is
+//   10)" / "Number of retries for known extractor errors (default is 3)"
+//   (yt-dlp --help). The defaults can burn the whole request budget on a single
+//   stuck socket; the Worker retries on a different container instance instead.
+const YT_DLP_COMMON_ARGS = [
+	"--sleep-requests",
+	"1",
+	"--socket-timeout",
+	"20",
+	"--retries",
+	"3",
+	"--extractor-retries",
+	"2",
+	"--extractor-args",
+	"youtube:player_client=default,-web;skip=hls,dash",
+	"--no-playlist",
+	"--no-warnings",
+	"--skip-download",
+];
+
 // Type definitions for yt-dlp subtitle info
 interface SubtitleInfo {
 	language: string | null;
 	subtitles: Record<string, unknown[]>;
 	automatic_captions: Record<string, unknown[]>;
+}
+
+interface VideoMetadata {
+	description: string;
+	view_count: number;
+	author: string;
+}
+
+interface VideoInfo extends SubtitleInfo {
+	metadata: VideoMetadata;
 }
 
 interface SelectedLanguage {
@@ -134,8 +184,13 @@ function parseVTT(content: string): string {
 
 // Parse yt-dlp error output
 function parseYtDlpError(stderr: string): TranscriptError {
+	// yt-dlp phrases this as both "Video unavailable" and "This video is
+	// unavailable" depending on the client that produced the error, so match
+	// case-insensitively on both. Getting this right matters because the Worker
+	// retries 5xx on another container instance; a genuinely missing video must
+	// map to 404 so it is not retried.
 	if (
-		stderr.includes("Video unavailable") ||
+		/video (is )?unavailable/i.test(stderr) ||
 		stderr.includes("is not a valid URL") ||
 		stderr.includes("Incomplete YouTube ID")
 	) {
@@ -162,10 +217,14 @@ function parseYtDlpError(stderr: string): TranscriptError {
 	return new TranscriptError(`yt-dlp error: ${stderr.trim()}`, "UNKNOWN", 500);
 }
 
-// Get available subtitles metadata from yt-dlp
-async function getAvailableSubtitles(url: string): Promise<SubtitleInfo> {
+// Fetch subtitle availability *and* video metadata in a single yt-dlp
+// invocation. Each invocation is an independent extraction (and therefore an
+// independent chance of being bot-checked or rate-limited), so the previously
+// separate `getAvailableSubtitles` and `getVideoMetadata` calls are merged into
+// one `--print` template.
+async function getVideoInfo(url: string): Promise<VideoInfo> {
 	const result =
-		await $`/usr/local/bin/yt-dlp --sleep-requests 1 --skip-download --no-warnings --no-playlist --print "%(.{language,subtitles,automatic_captions})#j" ${url}`
+		await $`${YT_DLP} ${YT_DLP_COMMON_ARGS} --print ${"%(.{language,subtitles,automatic_captions,description,view_count,uploader})#j"} ${url}`
 			.nothrow()
 			.quiet();
 
@@ -180,6 +239,11 @@ async function getAvailableSubtitles(url: string): Promise<SubtitleInfo> {
 		language: data.language ?? null,
 		subtitles: data.subtitles ?? {},
 		automatic_captions: data.automatic_captions ?? {},
+		metadata: {
+			description: data.description ?? "",
+			view_count: data.view_count ?? 0,
+			author: data.uploader ?? "",
+		},
 	};
 }
 
@@ -255,31 +319,6 @@ function selectLanguagePriorities(info: SubtitleInfo): SelectedLanguage[] {
 	for (const l of autoLangs) add(l, false);
 
 	return results;
-}
-
-// Get video metadata using yt-dlp
-async function getVideoMetadata(videoId: string): Promise<{
-	description: string;
-	view_count: number;
-	author: string;
-}> {
-	const result =
-		await $`/usr/local/bin/yt-dlp --sleep-requests 1 --skip-download --no-warnings --no-playlist --print "%(.{description,view_count,uploader})#j" "https://www.youtube.com/watch?v=${videoId}"`
-			.nothrow()
-			.quiet();
-
-	if (result.exitCode !== 0) {
-		throw parseYtDlpError(result.stderr.toString());
-	}
-
-	const output = result.stdout.toString().trim();
-	const data = JSON.parse(output);
-
-	return {
-		description: data.description ?? "",
-		view_count: data.view_count ?? 0,
-		author: data.uploader ?? "",
-	};
 }
 
 // Timeout wrapper
@@ -375,19 +414,10 @@ async function tryDownloadSubtitle(
 	await $`mkdir -p ${outputDir}`;
 
 	try {
-		const result = await $`/usr/local/bin/yt-dlp \
-      --sleep-requests 1 \
-      --write-sub \
-      --write-auto-sub \
-      --sub-lang ${targetLang} \
-      --sub-format vtt \
-      --skip-download \
-      --no-warnings \
-      --no-playlist \
-      -o "${outputDir}/%(id)s" \
-      ${url}`
-			.nothrow()
-			.quiet();
+		const result =
+			await $`${YT_DLP} ${YT_DLP_COMMON_ARGS} --write-sub --write-auto-sub --sub-lang ${targetLang} --sub-format vtt -o ${`${outputDir}/%(id)s`} ${url}`
+				.nothrow()
+				.quiet();
 
 		if (result.exitCode !== 0) {
 			const stderr = result.stderr.toString();
@@ -433,18 +463,10 @@ async function tryDownloadOriginalSubtitle(
 	const baseLang = originalLang.split("-")[0];
 
 	try {
-		const result = await $`/usr/local/bin/yt-dlp \
-      --sleep-requests 1 \
-      --write-auto-sub \
-      --sub-lang ${baseLang} \
-      --sub-format vtt \
-      --skip-download \
-      --no-warnings \
-      --no-playlist \
-      -o "${outputDir}/%(id)s" \
-      ${url}`
-			.nothrow()
-			.quiet();
+		const result =
+			await $`${YT_DLP} ${YT_DLP_COMMON_ARGS} --write-auto-sub --sub-lang ${baseLang} --sub-format vtt -o ${`${outputDir}/%(id)s`} ${url}`
+				.nothrow()
+				.quiet();
 
 		if (result.exitCode !== 0) {
 			const stderr = result.stderr.toString();
@@ -488,11 +510,16 @@ async function downloadAndParseTranscript(
 	detectedLanguage: string;
 	wasAutoDetected: boolean;
 	availableLanguages?: string[];
+	metadata: VideoMetadata;
 }> {
 	const videoId = extractVideoId(url);
 	if (!videoId) {
 		throw new TranscriptError("Could not extract video ID", "INVALID_URL", 400);
 	}
+
+	// Single yt-dlp invocation for both subtitle availability and video metadata.
+	const subtitleInfo = await getVideoInfo(url);
+	const { metadata } = subtitleInfo;
 
 	// When a specific language is requested, try it directly (no fallback)
 	if (lang && lang !== "auto") {
@@ -507,12 +534,11 @@ async function downloadAndParseTranscript(
 			subtitleType,
 			detectedLanguage: lang,
 			wasAutoDetected: false,
+			metadata,
 		};
 	}
 
-	// Auto-detection: get available subtitles and try languages in priority order
-	const subtitleInfo = await getAvailableSubtitles(url);
-
+	// Auto-detection: try languages in priority order
 	const availableLanguages = Array.from(
 		new Set([
 			...Object.keys(subtitleInfo.subtitles),
@@ -547,6 +573,7 @@ async function downloadAndParseTranscript(
 				detectedLanguage: selected.lang,
 				wasAutoDetected: true,
 				availableLanguages,
+				metadata,
 			};
 		} catch (error) {
 			if (error instanceof TranscriptError && error.code === "RATE_LIMITED") {
@@ -573,6 +600,7 @@ async function downloadAndParseTranscript(
 			detectedLanguage: result.detectedLanguage,
 			wasAutoDetected: true,
 			availableLanguages,
+			metadata,
 		};
 	} catch (error) {
 		if (error instanceof TranscriptError && error.code === "RATE_LIMITED") {
@@ -620,21 +648,15 @@ app.get("/transcript", async (c) => {
 
 	try {
 		console.log({ message: "Downloading transcript" });
+		// Subtitle info, transcript and video metadata now share one budget
+		// because metadata comes from the same yt-dlp invocation as the
+		// subtitle listing (previously 60s transcript + 30s metadata).
 		const result = await withTimeout(
 			downloadAndParseTranscript(url, lang),
-			60000, // 60 second timeout
+			90000, // 90 second timeout
 			"Transcript download timed out",
 		);
 		console.log({ message: "Downloading transcript", result });
-
-		// Fetch video metadata
-		console.log({ message: "Fetching video metadata" });
-		const videoMetadata = await withTimeout(
-			getVideoMetadata(result.videoId),
-			30000, // 30 second timeout for metadata
-			"Metadata fetch timed out",
-		);
-		console.log({ message: "Video metadata", videoMetadata });
 
 		return c.json({
 			success: true,
@@ -645,9 +667,9 @@ app.get("/transcript", async (c) => {
 				language: result.detectedLanguage,
 				wasAutoDetected: result.wasAutoDetected,
 				availableLanguages: result.availableLanguages,
-				description: videoMetadata.description,
-				view_count: videoMetadata.view_count,
-				author: videoMetadata.author,
+				description: result.metadata.description,
+				view_count: result.metadata.view_count,
+				author: result.metadata.author,
 			},
 		});
 	} catch (error) {

@@ -8,6 +8,24 @@ import z from "zod";
 
 const INSTANCE_COUNT = 50;
 
+// Transient container/YouTube failures worth retrying on a *different* random
+// container instance: each instance is a separate Cloudflare container with its
+// own egress, so a retry elsewhere can dodge an IP-level bot check or rate
+// limit. 4xx that are about the request itself (400/404) are never retried.
+const RETRY_BACKOFF_MS = [1500, 3000];
+
+function isRetryableContainerFailure(status: number, body: string): boolean {
+	if (status === 429 || status >= 500) {
+		return true;
+	}
+	if (status === 403) {
+		return /sign in|not a bot/i.test(body);
+	}
+	return false;
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 type ContainerResponse =
 	| {
 			success: true;
@@ -132,9 +150,6 @@ app.get(
 		try {
 			const { url, lang } = c.req.valid("query");
 
-			// Get a random container instance for load balancing
-			const container = await getRandom(c.env.MY_CONTAINER, INSTANCE_COUNT);
-
 			// Build URL with query params
 			const transcriptUrl = new URL("/transcript", "http://container");
 			transcriptUrl.searchParams.set("url", url);
@@ -143,22 +158,34 @@ app.get(
 				transcriptUrl.searchParams.set("lang", lang);
 			}
 
-			console.log({
-				message: "Fetching transcript from container",
-				transcriptUrl: transcriptUrl.toString(),
-			});
-			// Fetch from container
-			const response = await container.fetch(transcriptUrl.toString());
-			const text = await response.text();
-			if (response.ok) {
+			let response: Response | undefined;
+			let text = "";
+			const maxAttempts = RETRY_BACKOFF_MS.length + 1;
+			for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+				// Re-pick a random container instance on every attempt so a retry
+				// lands on different container egress.
+				const container = await getRandom(c.env.MY_CONTAINER, INSTANCE_COUNT);
+
 				console.log({
-					message: "Response from container",
-					status: response.status,
-					statusText: response.statusText,
-					ok: response.ok,
-					headers: Object.fromEntries(response.headers),
+					message: "Fetching transcript from container",
+					transcriptUrl: transcriptUrl.toString(),
+					attempt,
+					maxAttempts,
 				});
-			} else {
+				response = await container.fetch(transcriptUrl.toString());
+				text = await response.text();
+				if (response.ok) {
+					console.log({
+						message: "Response from container",
+						status: response.status,
+						statusText: response.statusText,
+						ok: response.ok,
+						headers: Object.fromEntries(response.headers),
+						attempt,
+					});
+					break;
+				}
+
 				console.error({
 					message: "Response from container",
 					status: response.status,
@@ -166,7 +193,32 @@ app.get(
 					ok: response.ok,
 					headers: Object.fromEntries(response.headers),
 					body: text,
+					attempt,
 				});
+
+				const backoffMs = RETRY_BACKOFF_MS[attempt - 1];
+				if (
+					attempt >= maxAttempts ||
+					!isRetryableContainerFailure(response.status, text)
+				) {
+					break;
+				}
+
+				console.warn({
+					message: "Retrying transcript fetch on a new container instance",
+					url,
+					status: response.status,
+					attempt,
+					nextAttempt: attempt + 1,
+					maxAttempts,
+					backoffMs,
+					body: text.slice(0, 500),
+				});
+				await sleep(backoffMs);
+			}
+
+			if (!response) {
+				return c.json({ error: "Container request never ran" }, 500);
 			}
 
 			let data: ContainerResponse;
