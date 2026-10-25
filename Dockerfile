@@ -13,15 +13,15 @@ RUN echo "Installing dependencies..."
 # `"impersonate": true` by the extractor; without curl_cffi yt-dlp emits
 # "no impersonate target is available" and the request is far more likely to be
 # rate-limited/bot-checked from a datacenter IP.
-# See https://github.com/yt-dlp/yt-dlp/tree/2026.08.19#impersonation
+# See https://github.com/yt-dlp/yt-dlp/tree/2026.10.21#impersonation
 #
 # deno >= 2.3.0 is the minimum supported JavaScript runtime for yt-dlp's EJS
 # challenge solver (https://github.com/yt-dlp/yt-dlp/wiki/EJS). The previously
 # pinned v2.1.4 was below that minimum and would have been rejected as
 # unsupported, leaving no usable JS runtime for the `tv`/`web_embedded` fallback
 # player clients.
-ARG YT_DLP_VERSION=2026.08.19
-ARG DENO_VERSION=v2.9.6
+ARG YT_DLP_VERSION=2026.10.21
+ARG DENO_VERSION=v2.9.8
 RUN apt-get update \
     && for attempt in 1 2 3 4 5; do \
          apt-get install -y --no-install-recommends -o Acquire::Retries=5 \
