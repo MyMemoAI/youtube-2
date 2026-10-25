@@ -31,6 +31,8 @@ type ContainerResponse =
 			success: true;
 			transcript: string;
 			metadata?: {
+				subtitleType?: "manual" | "auto" | "asr";
+				language?: string;
 				description?: string;
 				view_count?: number;
 				author?: string;
@@ -42,9 +44,24 @@ type ContainerResponse =
 			code?: string;
 	  };
 
-export class MyContainer extends Container {
+export class MyContainer extends Container<CloudflareBindings> {
 	defaultPort = 3000;
 	sleepAfter = "1m";
+
+	constructor(
+		ctx: ConstructorParameters<typeof Container>[0],
+		env: CloudflareBindings,
+	) {
+		super(ctx, env);
+		// Lets the container transcribe the audio of videos without captions.
+		// Without the secret it answers 404 "No subtitles" as before.
+		if (env.CF_API_TOKEN) {
+			this.envVars = {
+				CF_API_TOKEN: env.CF_API_TOKEN,
+				CF_ACCOUNT_ID: env.CF_ACCOUNT_ID,
+			};
+		}
+	}
 }
 
 function extractVideoId(url: string): string {
@@ -249,6 +266,9 @@ app.get(
 				thumbnail_url?: string;
 				title: string;
 				source: string;
+				// "asr" when the text was transcribed from the audio
+				subtitle_type?: string;
+				language?: string;
 				description?: string;
 				view_count?: number;
 				author?: string;
@@ -256,6 +276,8 @@ app.get(
 				source: extractVideoId(url),
 				thumbnail_url,
 				title,
+				subtitle_type: data.metadata?.subtitleType,
+				language: data.metadata?.language,
 				description: data.metadata?.description,
 				view_count: data.metadata?.view_count,
 				author: data.metadata?.author,
