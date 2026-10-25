@@ -60,11 +60,23 @@ interface VideoMetadata {
 
 interface VideoInfo extends SubtitleInfo {
 	metadata: VideoMetadata;
+	duration: number | null;
+	liveStatus: string | null;
 }
 
 interface SelectedLanguage {
 	lang: string;
 	isManual: boolean;
+}
+
+interface TranscriptResult {
+	transcript: string;
+	videoId: string;
+	subtitleType: "manual" | "auto" | "asr";
+	detectedLanguage: string;
+	wasAutoDetected: boolean;
+	availableLanguages?: string[];
+	metadata: VideoMetadata;
 }
 
 // Error class for transcript-specific errors
@@ -76,6 +88,19 @@ class TranscriptError extends Error {
 	) {
 		super(message);
 		this.name = "TranscriptError";
+	}
+}
+
+// The video lists no caption track in any language. Same message and code as
+// before, so the response is unchanged when audio transcription is off; it
+// carries the listing for the audio fallback in the /transcript handler.
+class NoCaptionTracksError extends TranscriptError {
+	constructor(
+		public videoId: string,
+		public info: VideoInfo,
+	) {
+		super("No subtitles available for this video", "NO_SUBTITLES", 404);
+		this.name = "NoCaptionTracksError";
 	}
 }
 
@@ -226,7 +251,7 @@ function parseYtDlpError(stderr: string): TranscriptError {
 // one `--print` template.
 async function getVideoInfo(url: string): Promise<VideoInfo> {
 	const result =
-		await $`${YT_DLP} ${YT_DLP_COMMON_ARGS} --print ${"%(.{language,subtitles,automatic_captions,description,view_count,uploader})#j"} ${url}`
+		await $`${YT_DLP} ${YT_DLP_COMMON_ARGS} --print ${"%(.{language,subtitles,automatic_captions,description,view_count,uploader,duration,live_status})#j"} ${url}`
 			.nothrow()
 			.quiet();
 
@@ -246,6 +271,8 @@ async function getVideoInfo(url: string): Promise<VideoInfo> {
 			view_count: data.view_count ?? 0,
 			author: data.uploader ?? "",
 		},
+		duration: typeof data.duration === "number" ? data.duration : null,
+		liveStatus: data.live_status ?? null,
 	};
 }
 
@@ -547,15 +574,7 @@ async function tryDownloadOriginalSubtitle(
 async function downloadAndParseTranscript(
 	url: string,
 	lang?: string,
-): Promise<{
-	transcript: string;
-	videoId: string;
-	subtitleType: "manual" | "auto";
-	detectedLanguage: string;
-	wasAutoDetected: boolean;
-	availableLanguages?: string[];
-	metadata: VideoMetadata;
-}> {
+): Promise<TranscriptResult> {
 	const videoId = extractVideoId(url);
 	if (!videoId) {
 		throw new TranscriptError(
@@ -596,11 +615,7 @@ async function downloadAndParseTranscript(
 
 	const priorities = selectLanguagePriorities(subtitleInfo);
 	if (priorities.length === 0) {
-		throw new TranscriptError(
-			"No subtitles available for this video",
-			"NO_SUBTITLES",
-			404,
-		);
+		throw new NoCaptionTracksError(videoId, subtitleInfo);
 	}
 
 	// Try top priority languages first (max 2 to stay within timeout budget)
@@ -672,6 +687,321 @@ async function downloadAndParseTranscript(
 	}
 }
 
+// Speech-to-text fallback for videos that list no caption track at all
+// (about 170 saves a month in production in October 2026: mostly languages
+// YouTube does not auto-caption and uploads with captions turned off). The
+// audio is cut into 5-minute chunks and sent to Cloudflare Workers AI
+// Whisper, the model mymemo-service uses for uploaded audio. It runs only when
+// the Worker passes CF_API_TOKEN and CF_ACCOUNT_ID into the container.
+const WHISPER_MODEL = "@cf/openai/whisper-large-v3-turbo";
+
+// Measured 2026-10-25: Whisper takes 18-26 s for a 5-minute chunk and 238 s
+// for one 43-minute request, so long audio has to go out in parallel chunks.
+const ASR_CHUNK_SECONDS = 300;
+const ASR_CONCURRENCY = 10;
+const ASR_MAX_DURATION_SECONDS = 2 * 60 * 60;
+const WHISPER_MAX_ATTEMPTS = 3;
+
+// The whole /transcript request, caption listing included, has to answer
+// within this: the Worker still looks up the title afterwards, and
+// mymemo-service gives the Worker 300 s. Below Bun's 255 s idleTimeout too.
+const ASR_DEADLINE_MS = 220_000;
+
+interface WhisperEndpoint {
+	url: string;
+	token: string;
+}
+
+interface WhisperResponse {
+	result?: {
+		text?: string;
+		transcription_info?: { language?: string };
+	};
+}
+
+function whisperEndpoint(): WhisperEndpoint | null {
+	const token = process.env.CF_API_TOKEN;
+	const accountId = process.env.CF_ACCOUNT_ID;
+	if (!token || !accountId) return null;
+	return {
+		url: `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/${WHISPER_MODEL}`,
+		token,
+	};
+}
+
+// 424 rather than 5xx: the Worker and mymemo-service both retry 5xx, and each
+// retry would download and transcribe the whole video again, past their
+// time limits.
+function transcriptionFailed(detail: string): TranscriptError {
+	return new TranscriptError(
+		`This video has no captions, and transcribing its audio failed: ${detail}`,
+		"TRANSCRIPTION_FAILED",
+		424,
+	);
+}
+
+// Bun's `$` cannot be cancelled, so the fallback spawns directly: when the
+// deadline passes, yt-dlp and ffmpeg are killed instead of running on.
+async function runCommand(
+	cmd: string[],
+	signal: AbortSignal,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+	const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe", signal });
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	signal.throwIfAborted();
+	return { exitCode, stdout, stderr };
+}
+
+// Download the smallest Opus audio-only format, else the smallest audio
+// (`-S +abr` ranks the lowest audio bitrate best): about 50 kbps, plenty for
+// speech recognition.
+async function downloadAudio(
+	url: string,
+	dir: string,
+	signal: AbortSignal,
+): Promise<string> {
+	const args = YT_DLP_COMMON_ARGS.filter((arg) => arg !== "--skip-download");
+	const result = await runCommand(
+		[
+			YT_DLP,
+			...args,
+			"-f",
+			"ba[acodec=opus]/ba/b",
+			"-S",
+			"+abr",
+			"--max-filesize",
+			"300M",
+			// Replays of recent live streams come as hundreds of small DASH
+			// fragments: 6 minutes for 50 minutes of audio one at a time, 36 s
+			// with 16 in parallel. No effect on ordinary single-file formats.
+			"--concurrent-fragments",
+			"16",
+			"-o",
+			`${dir}/audio.%(ext)s`,
+			"--print",
+			"after_move:filepath",
+			"--no-simulate",
+			url,
+		],
+		signal,
+	);
+	if (result.exitCode !== 0) {
+		throw parseYtDlpError(result.stderr);
+	}
+	const path = result.stdout.trim().split("\n").pop();
+	if (!path) {
+		throw transcriptionFailed("yt-dlp downloaded no audio");
+	}
+	return path;
+}
+
+// Cut into chunks without re-encoding (~1.9 MB per 5 minutes). Re-encoding to
+// 16 kHz mono took 9-12 s per 10 minutes of audio on half a CPU (standard-1)
+// and did not make Whisper faster. YouTube's webm audio is Opus, which goes
+// into Ogg; AAC goes into m4a. `-t` bounds the work when yt-dlp reported no
+// duration.
+async function splitAudio(
+	input: string,
+	dir: string,
+	signal: AbortSignal,
+): Promise<string[]> {
+	const ext = input.endsWith(".webm") ? "ogg" : "m4a";
+	const result = await runCommand(
+		[
+			"ffmpeg",
+			"-nostdin",
+			"-hide_banner",
+			"-loglevel",
+			"error",
+			"-i",
+			input,
+			"-map",
+			"0:a:0",
+			"-c",
+			"copy",
+			"-t",
+			String(ASR_MAX_DURATION_SECONDS),
+			"-f",
+			"segment",
+			"-segment_time",
+			String(ASR_CHUNK_SECONDS),
+			`${dir}/chunk%03d.${ext}`,
+		],
+		signal,
+	);
+	if (result.exitCode !== 0) {
+		throw transcriptionFailed(`ffmpeg: ${result.stderr.trim().slice(0, 300)}`);
+	}
+	const chunks: string[] = [];
+	for await (const file of new Bun.Glob("chunk*").scan(dir)) {
+		chunks.push(`${dir}/${file}`);
+	}
+	if (chunks.length === 0) {
+		throw transcriptionFailed("ffmpeg produced no audio");
+	}
+	return chunks.sort();
+}
+
+// No `language` is sent: these videos report none, and the uploader's declared
+// language would force Whisper to that language even when it is wrong. Whisper
+// detects it per chunk; `vad_filter` skips music and silence, where Whisper
+// otherwise invents text.
+async function transcribeChunk(
+	endpoint: WhisperEndpoint,
+	path: string,
+	signal: AbortSignal,
+): Promise<{ text: string; language: string | null }> {
+	const audio = Buffer.from(await Bun.file(path).arrayBuffer()).toString(
+		"base64",
+	);
+	const body = JSON.stringify({ audio, vad_filter: true });
+	for (let attempt = 1; ; attempt++) {
+		let status = 0;
+		let detail: string;
+		try {
+			const response = await fetch(endpoint.url, {
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${endpoint.token}`,
+					"Content-Type": "application/json",
+				},
+				body,
+				signal,
+			});
+			if (response.ok) {
+				const data = (await response.json()) as WhisperResponse;
+				return {
+					text: (data.result?.text ?? "").trim(),
+					language: data.result?.transcription_info?.language ?? null,
+				};
+			}
+			status = response.status;
+			detail = (await response.text()).slice(0, 300);
+		} catch (error) {
+			signal.throwIfAborted();
+			detail = error instanceof Error ? error.message : String(error);
+		}
+		const retryable = status === 0 || status === 429 || status >= 500;
+		if (!retryable || attempt >= WHISPER_MAX_ATTEMPTS) {
+			throw transcriptionFailed(
+				`Whisper ${status ? `HTTP ${status}` : "request failed"}: ${detail}`,
+			);
+		}
+		await Bun.sleep(attempt * 2000);
+	}
+}
+
+async function mapWithConcurrency<T, R>(
+	items: T[],
+	limit: number,
+	fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+	const results = new Array<R>(items.length);
+	let next = 0;
+	const workers = Array.from(
+		{ length: Math.min(limit, items.length) },
+		async () => {
+			while (next < items.length) {
+				const index = next++;
+				results[index] = await fn(items[index]);
+			}
+		},
+	);
+	await Promise.all(workers);
+	return results;
+}
+
+async function transcribeVideoAudio(
+	url: string,
+	videoId: string,
+	info: VideoInfo,
+	endpoint: WhisperEndpoint,
+	deadline: number,
+): Promise<TranscriptResult> {
+	if (info.liveStatus === "is_live" || info.liveStatus === "is_upcoming") {
+		throw new TranscriptError(
+			"This live stream or premiere has not ended yet, so it has no captions. Save it again after it ends.",
+			"NO_SUBTITLES",
+			404,
+		);
+	}
+	if (info.duration !== null && info.duration > ASR_MAX_DURATION_SECONDS) {
+		throw new TranscriptError(
+			`This video has no captions, and at ${Math.round(info.duration / 60)} minutes it is longer than the ${ASR_MAX_DURATION_SECONDS / 60}-minute limit for transcribing its audio.`,
+			"NO_SUBTITLES",
+			404,
+		);
+	}
+
+	const budgetMs = Math.max(deadline - Date.now(), 1);
+	const timeout = AbortSignal.timeout(budgetMs);
+	const failure = new AbortController();
+	const signal = AbortSignal.any([timeout, failure.signal]);
+	const dir = `/tmp/asr/${videoId}_${Date.now()}`;
+	await $`mkdir -p ${dir}`;
+
+	try {
+		const startedAt = Date.now();
+		const audioPath = await downloadAudio(url, dir, signal);
+		const downloadedAt = Date.now();
+		const chunks = await splitAudio(audioPath, dir, signal);
+		const splitAt = Date.now();
+		const results = await mapWithConcurrency(chunks, ASR_CONCURRENCY, (chunk) =>
+			transcribeChunk(endpoint, chunk, signal),
+		).catch((error) => {
+			// Stop the chunks still in flight.
+			failure.abort();
+			throw error;
+		});
+
+		const transcript = results
+			.map((r) => r.text)
+			.filter(Boolean)
+			.join("\n");
+		console.log({
+			message: "Transcribed audio",
+			videoId,
+			duration: info.duration,
+			chunks: chunks.length,
+			downloadMs: downloadedAt - startedAt,
+			splitMs: splitAt - downloadedAt,
+			whisperMs: Date.now() - splitAt,
+			characters: transcript.length,
+		});
+		if (!transcript) {
+			throw new TranscriptError(
+				"This video has no captions, and no speech was found in its audio.",
+				"NO_SUBTITLES",
+				404,
+			);
+		}
+
+		return {
+			transcript,
+			videoId,
+			subtitleType: "asr",
+			detectedLanguage:
+				results.find((r) => r.text && r.language)?.language ?? "",
+			wasAutoDetected: true,
+			availableLanguages: [],
+			metadata: info.metadata,
+		};
+	} catch (error) {
+		if (timeout.aborted) {
+			throw transcriptionFailed(
+				`it did not finish within ${Math.round(budgetMs / 1000)} seconds`,
+			);
+		}
+		throw error;
+	} finally {
+		await $`rm -rf ${dir}`.nothrow();
+	}
+}
+
 // Health check endpoint
 app.get("/", (c) => c.json({ status: "ok" }));
 
@@ -698,16 +1028,38 @@ app.get("/transcript", async (c) => {
 		);
 	}
 
+	const startedAt = Date.now();
 	try {
 		console.log({ message: "Downloading transcript" });
-		// Subtitle info, transcript and video metadata now share one budget
-		// because metadata comes from the same yt-dlp invocation as the
-		// subtitle listing (previously 60s transcript + 30s metadata).
-		const result = await withTimeout(
-			downloadAndParseTranscript(url, lang),
-			90000, // 90 second timeout
-			"Transcript download timed out",
-		);
+		let result: TranscriptResult;
+		try {
+			// Subtitle info, transcript and video metadata now share one budget
+			// because metadata comes from the same yt-dlp invocation as the
+			// subtitle listing (previously 60s transcript + 30s metadata).
+			result = await withTimeout(
+				downloadAndParseTranscript(url, lang),
+				90000, // 90 second timeout
+				"Transcript download timed out",
+			);
+		} catch (error) {
+			const endpoint = whisperEndpoint();
+			if (!(error instanceof NoCaptionTracksError) || !endpoint) {
+				throw error;
+			}
+			console.log({
+				message: "No caption tracks; transcribing the audio",
+				videoId: error.videoId,
+				duration: error.info.duration,
+				liveStatus: error.info.liveStatus,
+			});
+			result = await transcribeVideoAudio(
+				url,
+				error.videoId,
+				error.info,
+				endpoint,
+				startedAt + ASR_DEADLINE_MS,
+			);
+		}
 		console.log({ message: "Downloading transcript", result });
 
 		return c.json({
@@ -728,7 +1080,7 @@ app.get("/transcript", async (c) => {
 		if (error instanceof TranscriptError) {
 			return c.json(
 				{ success: false, error: error.message, code: error.code },
-				error.statusCode as 400 | 403 | 404 | 429 | 500 | 504,
+				error.statusCode as 400 | 403 | 404 | 424 | 429 | 500 | 504,
 			);
 		}
 		console.error("Unexpected error:", error);
@@ -741,5 +1093,6 @@ app.get("/transcript", async (c) => {
 
 export default {
 	fetch: app.fetch,
-	idleTimeout: 120, // 120 seconds to handle slow yt-dlp operations
+	// Bun's maximum; the audio fallback answers within ASR_DEADLINE_MS
+	idleTimeout: 255,
 };

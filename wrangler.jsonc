@@ -6,9 +6,11 @@
 	// "compatibility_flags": [
 	//   "nodejs_compat"
 	// ],
-	// "vars": {
-	//   "MY_VAR": "my-variable"
-	// },
+	// The container transcribes caption-less videos with Workers AI Whisper on
+	// this account; the token is the CF_API_TOKEN secret.
+	"vars": {
+		"CF_ACCOUNT_ID": "6767a2f2dd17c493f5a71e0f3b945539"
+	},
 	// "kv_namespaces": [
 	//   {
 	//     "binding": "MY_KV_NAMESPACE",
