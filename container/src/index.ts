@@ -8,9 +8,11 @@ const YT_DLP = "/usr/local/bin/yt-dlp";
 // Flags shared by every yt-dlp invocation.
 //
 // --extractor-args youtube:player_client=default,-web
-//   The default clients are `visionos,web` (yt-dlp 2026.08.19 README, "EXTRACTOR
-//   ARGUMENTS" > youtube > player_client). The `web` client is the one that
-//   carries WEB_PO_TOKEN_POLICIES and needs a JS challenge solve, and it is the
+//   The default clients are `tv_samsung,visionos,web` (yt-dlp 2026.10.21 README,
+//   "EXTRACTOR ARGUMENTS" > youtube > player_client), so this runs
+//   `tv_samsung,visionos`; `tv_samsung` needs the JavaScript runtime (deno,
+//   installed by the Dockerfile) and is skipped without one. The `web` client
+//   is the one that carries WEB_PO_TOKEN_POLICIES and needs a JS challenge solve, and it is the
 //   client that produces "Sign in to confirm you're not a bot" from datacenter
 //   IPs without cookies/PO tokens. `visionos` requires no PO token and sets
 //   REQUIRE_JS_PLAYER=False, and yt-dlp still falls back to `tv_downgraded` /
@@ -252,6 +254,35 @@ function baseLangCode(lang: string): string {
 	return lang.split("-")[0];
 }
 
+const ORIG_SUFFIX = "-orig";
+
+// Find the auto-caption key for the video's original speech.
+//
+// YouTube lists one "<lang>-orig" key per audio track: the speech recognised
+// in that track, untranslated. The plain "<lang>" key can instead be a machine
+// translation of another track: on an auto-dubbed English video, "en" was
+// `lang=ar&tlang=en` (English translated from the Arabic dub's captions) while
+// "en-orig" was `lang=en` with no `tlang`. YouTube rate-limits translated
+// tracks hard (HTTP 429, yt-dlp issue #13831), so asking for "en" failed on
+// every dubbed video. Dubbed videos list several "-orig" keys, so match the
+// video's own language; without one, only a lone "-orig" key is unambiguous.
+function findOriginalAutoLang(
+	autoLangs: string[],
+	originalLang: string | null,
+): string | undefined {
+	const origLangs = autoLangs.filter((l) => l.endsWith(ORIG_SUFFIX));
+	if (originalLang) {
+		const exact = `${originalLang}${ORIG_SUFFIX}`;
+		if (origLangs.includes(exact)) return exact;
+		const base = baseLangCode(originalLang);
+		const sameBase = origLangs.find(
+			(l) => baseLangCode(l.slice(0, -ORIG_SUFFIX.length)) === base,
+		);
+		if (sameBase) return sameBase;
+	}
+	return origLangs.length === 1 ? origLangs[0] : undefined;
+}
+
 // Find a language key matching a locale (e.g. "pt-BR" matches "pt")
 // Skips "-orig" suffixed keys (handled separately)
 function findMatchingLang(langs: string[], target: string): string | undefined {
@@ -298,24 +329,29 @@ function selectLanguagePriorities(info: SubtitleInfo): SelectedLanguage[] {
 	// Priority 3: Any manual
 	for (const l of manualLangs) add(l, true);
 
-	// Priority 4: Auto in original language using base code (e.g. "pt-BR" -> try "pt")
-	// The "-orig" keys in automatic_captions are yt-dlp metadata markers;
-	// --sub-lang should use the base language code to get the original (non-translated) subtitle.
-	if (originalLang) {
+	// Priority 4: Auto in the original speech ("<lang>-orig", never a
+	// translation). Listings without "-orig" keys fall back to the base code
+	// (e.g. "pt-BR" -> "pt").
+	const originalAuto = findOriginalAutoLang(autoLangs, originalLang);
+	if (originalAuto) {
+		add(originalAuto, false);
+	} else if (originalLang) {
 		const base = baseLangCode(originalLang);
-		// Add the base code directly — it downloads the original speech-recognized subtitle
-		// which doesn't hit YouTube's translation API and is less likely to be rate-limited
-		if (autoLangs.some((l) => l === base || l === `${base}-orig`)) {
-			add(base, false);
-		}
+		if (autoLangs.includes(base)) add(base, false);
 	}
-	// Priority 5: Auto in English
-	const enAuto = autoLangs.find(
-		(l) => l === "en" || (l.startsWith("en-") && !l.endsWith("-orig")),
-	);
-	if (enAuto) add("en", false);
+	// Priority 5: Auto in English, the untranslated track when there is one
+	if (autoLangs.includes(`en${ORIG_SUFFIX}`)) {
+		add(`en${ORIG_SUFFIX}`, false);
+	} else if (
+		autoLangs.some(
+			(l) => l === "en" || (l.startsWith("en-") && !l.endsWith(ORIG_SUFFIX)),
+		)
+	) {
+		add("en", false);
+	}
 
-	// Priority 7: Any remaining auto
+	// Priority 6: Any remaining untranslated auto track, then the rest
+	for (const l of autoLangs) if (l.endsWith(ORIG_SUFFIX)) add(l, false);
 	for (const l of autoLangs) add(l, false);
 
 	return results;
@@ -440,7 +476,13 @@ async function tryDownloadSubtitle(
 			throw new TranscriptError("Transcript is empty", "NO_SUBTITLES", 404);
 		}
 
-		return { transcript, subtitleType: subtitleFile.type };
+		// yt-dlp names "-orig" auto captions without the ".auto." marker
+		return {
+			transcript,
+			subtitleType: targetLang.endsWith(ORIG_SUFFIX)
+				? "auto"
+				: subtitleFile.type,
+		};
 	} finally {
 		await $`rm -rf ${outputDir}`.nothrow();
 	}
@@ -451,6 +493,7 @@ async function tryDownloadOriginalSubtitle(
 	url: string,
 	videoId: string,
 	originalLang: string,
+	originalAutoLang: string | undefined,
 ): Promise<{
 	transcript: string;
 	subtitleType: "manual" | "auto";
@@ -459,12 +502,13 @@ async function tryDownloadOriginalSubtitle(
 	const outputDir = `/tmp/subs/${videoId}_${Date.now()}`;
 	await $`mkdir -p ${outputDir}`;
 
-	// Use the base language code (e.g. "pt-BR" -> "pt") for --sub-lang
-	const baseLang = originalLang.split("-")[0];
+	// The untranslated "<lang>-orig" track when listed, else the base code
+	// (e.g. "pt-BR" -> "pt")
+	const subLang = originalAutoLang ?? baseLangCode(originalLang);
 
 	try {
 		const result =
-			await $`${YT_DLP} ${YT_DLP_COMMON_ARGS} --write-auto-sub --sub-lang ${baseLang} --sub-format vtt -o ${`${outputDir}/%(id)s`} ${url}`
+			await $`${YT_DLP} ${YT_DLP_COMMON_ARGS} --write-auto-sub --sub-lang ${subLang} --sub-format vtt -o ${`${outputDir}/%(id)s`} ${url}`
 				.nothrow()
 				.quiet();
 
@@ -491,7 +535,7 @@ async function tryDownloadOriginalSubtitle(
 
 		return {
 			transcript,
-			subtitleType: subtitleFile.type,
+			subtitleType: subLang.endsWith(ORIG_SUFFIX) ? "auto" : subtitleFile.type,
 			detectedLanguage: subtitleFile.lang,
 		};
 	} finally {
@@ -514,7 +558,11 @@ async function downloadAndParseTranscript(
 }> {
 	const videoId = extractVideoId(url);
 	if (!videoId) {
-		throw new TranscriptError("Could not extract video ID", "INVALID_URL", 400);
+		throw new TranscriptError(
+			"Could not extract video ID: this is not a single video link (channel and playlist pages have no transcript). Save the link of one video instead.",
+			"INVALID_URL",
+			400,
+		);
 	}
 
 	// Single yt-dlp invocation for both subtitle availability and video metadata.
@@ -592,6 +640,10 @@ async function downloadAndParseTranscript(
 			url,
 			videoId,
 			subtitleInfo.language ?? "en",
+			findOriginalAutoLang(
+				Object.keys(subtitleInfo.automatic_captions),
+				subtitleInfo.language,
+			),
 		);
 		return {
 			transcript: result.transcript,
