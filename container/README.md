@@ -8,12 +8,18 @@ To run:
 bun run dev
 ```
 
+To test (pure caption helpers in `src/captions.ts`):
+```sh
+bun test
+```
+
 open http://localhost:3000
 
 ## Videos without captions
 
-When a video lists no caption track in any language, `/transcript` downloads
-its audio and transcribes it with Cloudflare Workers AI Whisper
+When a video lists no caption track in any language, or every track tried
+(the top two by priority, then the original-language track) comes back
+missing or empty, `/transcript` downloads its audio and transcribes it with Cloudflare Workers AI Whisper
 (`@cf/openai/whisper-large-v3-turbo`, about $0.03 per hour of audio). The
 response then has `metadata.subtitleType: "asr"`. This needs two environment
 variables, which the Worker passes in from its `CF_ACCOUNT_ID` var and
