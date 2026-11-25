@@ -76,44 +76,51 @@ export function parseYtDlpError(stderr: string): TranscriptError {
 			403,
 		);
 	}
-	if (stderr.includes("Private video")) {
+	// YouTube's bot check ("Sign in to confirm you're not a bot") and the
+	// captcha yt-dlp reports. They depend on the container's egress, so the
+	// message keeps "not a bot" and the Worker and mymemo-service retry it on
+	// another container instance, as they always have.
+	if (/not a bot|captcha challenge/i.test(stderr)) {
 		return new TranscriptError(
-			`Video is private or requires authentication: ${youtubeReason(stderr)}`,
-			"ACCESS_DENIED",
-			403,
-		);
-	}
-	// YouTube's bot check. It has read "Sign in to confirm you're not a bot"
-	// and, lowercase, "Please sign in. This helps protect our community" (yt-dlp
-	// drops the second sentence when YouTube ends it with "Learn more"). The
-	// message keeps "sign in", so the Worker and mymemo-service retry it on
-	// another container instance as they did before.
-	if (
-		/not a bot|please sign in|protect our community|captcha challenge/i.test(
-			stderr,
-		)
-	) {
-		return new TranscriptError(
-			`YouTube's bot protection asked MyMemo to sign in, so it could not read this video: ${youtubeReason(stderr)}`,
+			`YouTube asked MyMemo to prove it is not a bot, so it could not read this video: ${youtubeReason(stderr)}`,
 			"BOT_CHECK",
 			403,
 		);
 	}
-	// Any other video YouTube shows only to signed-in viewers, such as
-	// age-restricted ones ("Sign in to confirm your age").
-	if (/sign in/i.test(stderr)) {
+	// The refusals below belong to the video and come back the same from every
+	// container, so their messages leave out "sign in" and "not a bot" (yt-dlp's
+	// text has them) and the Worker and mymemo-service answer at once.
+	//
+	// "Private video. Sign in if you've been granted access to this video".
+	// mymemo-service files "video is private" as youtube_private.
+	if (/private video/i.test(stderr)) {
 		return new TranscriptError(
-			`Video is private or requires authentication: ${youtubeReason(stderr)}`,
+			"Video is private, so MyMemo cannot read it.",
 			"ACCESS_DENIED",
 			403,
 		);
 	}
-	// "Join this channel to get access to members-only content like this
-	// video, and other exclusive perks."
+	// "This video is available to this channel's members on level: …. Join
+	// this channel to get access to members-only content and other exclusive
+	// perks." mymemo-service files "join this channel" as youtube_members_only.
 	if (/join this channel|members-only content/i.test(stderr)) {
 		return new TranscriptError(
 			`This video is only for the channel's paying members: ${youtubeReason(stderr)}`,
 			"MEMBERS_ONLY",
+			403,
+		);
+	}
+	// Videos YouTube shows only to signed-in viewers: "Please sign in. This
+	// helps protect our community." (lowercase "sign in"; it came back the
+	// same from a residential IP on 2026-11-24 while other videos played) and
+	// age-restricted ones, "Sign in to confirm your age".
+	if (/sign in/i.test(stderr)) {
+		const what = /confirm your age/i.test(stderr)
+			? "this age-restricted video"
+			: "this video";
+		return new TranscriptError(
+			`YouTube shows ${what} only to signed-in viewers, and MyMemo never signs in to YouTube, so it could not read it.`,
+			"LOGIN_REQUIRED",
 			403,
 		);
 	}
