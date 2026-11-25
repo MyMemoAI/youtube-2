@@ -10,6 +10,7 @@ import {
 	selectLanguagePriorities,
 	subtitleLangAliases,
 } from "./captions";
+import { parseYtDlpError, TranscriptError } from "./errors";
 
 const app = new Hono();
 
@@ -18,16 +19,18 @@ const YT_DLP = "/usr/local/bin/yt-dlp";
 // Flags shared by every yt-dlp invocation.
 //
 // --extractor-args youtube:player_client=default,-web
-//   The default clients are `tv_samsung,visionos,web` (yt-dlp 2026.10.21 README,
-//   "EXTRACTOR ARGUMENTS" > youtube > player_client), so this runs
-//   `tv_samsung,visionos`; `tv_samsung` needs the JavaScript runtime (deno,
+//   yt-dlp 2026.11.23 "temporarily" removed `web` from the default clients,
+//   leaving `tv_samsung,visionos` (`_DEFAULT_CLIENTS` in
+//   yt_dlp/extractor/youtube/_video.py). `-web` is kept so `web` stays off
+//   when yt-dlp adds it back. `tv_samsung` needs the JavaScript runtime (deno,
 //   installed by the Dockerfile) and is skipped without one. The `web` client
 //   is the one that carries WEB_PO_TOKEN_POLICIES and needs a JS challenge solve, and it is the
 //   client that produces "Sign in to confirm you're not a bot" from datacenter
 //   IPs without cookies/PO tokens. `visionos` requires no PO token and sets
-//   REQUIRE_JS_PLAYER=False, and yt-dlp still falls back to `tv_downgraded` /
-//   `web_embedded` on its own when `visionos` cannot access a video. The `-`
-//   exclusion prefix is documented in the same README section.
+//   REQUIRE_JS_PLAYER=False, and yt-dlp still falls back to `web_embedded` /
+//   `ios_producer` on its own when `visionos` cannot access a "made for kids"
+//   video. The `-` exclusion prefix is documented in the yt-dlp README,
+//   "EXTRACTOR ARGUMENTS" > youtube > player_client.
 // --extractor-args youtube:skip=hls,dash
 //   "One or more of `hls`, `dash` or `translated_subs` to skip extraction of the
 //   m3u8 manifests, dash manifests ... respectively" (same README section). We
@@ -75,18 +78,6 @@ interface TranscriptResult {
 	wasAutoDetected: boolean;
 	availableLanguages?: string[];
 	metadata: VideoMetadata;
-}
-
-// Error class for transcript-specific errors
-class TranscriptError extends Error {
-	constructor(
-		message: string,
-		public code: string,
-		public statusCode: number = 500,
-	) {
-		super(message);
-		this.name = "TranscriptError";
-	}
 }
 
 // The video has no usable caption track: it lists none in any language, or
@@ -159,41 +150,6 @@ function extractVideoId(url: string): string | null {
 	} catch {
 		return null;
 	}
-}
-
-// Parse yt-dlp error output
-function parseYtDlpError(stderr: string): TranscriptError {
-	// yt-dlp phrases this as both "Video unavailable" and "This video is
-	// unavailable" depending on the client that produced the error, so match
-	// case-insensitively on both. Getting this right matters because the Worker
-	// retries 5xx on another container instance; a genuinely missing video must
-	// map to 404 so it is not retried.
-	if (
-		/video (is )?unavailable/i.test(stderr) ||
-		stderr.includes("is not a valid URL") ||
-		stderr.includes("Incomplete YouTube ID")
-	) {
-		return new TranscriptError(
-			`Video not found: ${stderr.trim()}`,
-			"VIDEO_NOT_FOUND",
-			404,
-		);
-	}
-	if (stderr.includes("429") || stderr.includes("Too Many Requests")) {
-		return new TranscriptError(
-			`Rate limited by YouTube: ${stderr.trim()}`,
-			"RATE_LIMITED",
-			429,
-		);
-	}
-	if (stderr.includes("Private video") || stderr.includes("Sign in")) {
-		return new TranscriptError(
-			`Video is private or requires authentication: ${stderr.trim()}`,
-			"ACCESS_DENIED",
-			403,
-		);
-	}
-	return new TranscriptError(`yt-dlp error: ${stderr.trim()}`, "UNKNOWN", 500);
 }
 
 // Fetch subtitle availability *and* video metadata in a single yt-dlp
