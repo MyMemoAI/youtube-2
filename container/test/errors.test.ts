@@ -87,12 +87,21 @@ describe("parseYtDlpError: refusals are 403, never 500", () => {
 		expect(bare.code).toBe("GEO_BLOCKED");
 		expect(bare.message).not.toContain("lists it");
 
-		const many = Array.from({ length: 12 }, (_, i) => `Country${i}`).join(", ");
+		// yt-dlp's full names can contain the separator ("Korea, Republic of").
+		const many = [
+			"Korea, Republic of",
+			...Array.from({ length: 30 }, (_, i) => `Country${i}`),
+		].join(", ");
 		const long = parseYtDlpError(
 			`ERROR: [youtube] qT-urhn-glQ: The uploader has not made this video available in your country\nThis video is available in ${many}.\n`,
 		);
-		expect(long.message).toContain("Country7 and 4 more.");
-		expect(long.message).not.toContain("Country8");
+		expect(long.message).toContain(
+			"available in Korea, Republic of, Country0, Country1,",
+		);
+		expect(long.message).toEndWith(" and others.");
+		expect(long.message).not.toContain("Country29");
+		// mymemo-service keeps the first 240 characters.
+		expect(long.message.length).toBeLessThan(240);
 	});
 
 	test("a video ID containing 429 does not turn a refusal into a rate limit", () => {

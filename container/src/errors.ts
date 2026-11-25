@@ -63,13 +63,15 @@ export function parseYtDlpError(stderr: string): TranscriptError {
 		/not made this video available in your country/i.test(stderr) ||
 		/not available from your location/i.test(stderr)
 	) {
-		const listed = stderr
-			.match(/This video is available in ([^\n]+?)\.?$/m)?.[1]
-			.split(", ");
+		// Cut by length, not by count: names such as "Korea, Republic of"
+		// contain the separator.
+		const listed = stderr.match(
+			/This video is available in ([^\n]+?)\.?$/m,
+		)?.[1];
 		const countries =
-			listed && listed.length > 8
-				? `${listed.slice(0, 8).join(", ")} and ${listed.length - 8} more`
-				: listed?.join(", ");
+			listed && listed.length > 70
+				? `${listed.slice(0, listed.lastIndexOf(", ", 70))} and others`
+				: listed;
 		return new TranscriptError(
 			`The uploader has made this video available only in some countries, and MyMemo cannot read it from where its servers are.${countries ? ` YouTube lists it as available in ${countries}.` : ""}`,
 			"GEO_BLOCKED",
